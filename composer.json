@@ -1,5 +1,5 @@
 {
-  "name":"tunaabutbul/cloudflare-middleware",
+  "name":"sergey-s-moiseev/cloudflare-middleware",
   "description":"Cloudflare Middleware For Guzzle",
   "keywords":[
     "Cloudflare",
@@ -16,6 +16,9 @@
     {
       "name":"Tuna Abutbul",
       "email":"tuna.abutbul+github@gmail.com"
+    },    {
+      "name":"Sergey S. Moiseev",
+      "email":"sergey.s.moiseev@gmail.com"
     }
   ],
   "minimum-stability":"dev",
