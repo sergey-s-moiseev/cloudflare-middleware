@@ -19,6 +19,9 @@
     },    {
       "name":"Sergey S. Moiseev",
       "email":"sergey.s.moiseev@gmail.com"
+    },    {
+      "name":"Alex V. Romanenko",
+      "email":"romanenko.alex.v@gmail.com"
     }
   ],
   "minimum-stability":"dev",

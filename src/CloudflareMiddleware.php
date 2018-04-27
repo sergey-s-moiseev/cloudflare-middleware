@@ -6,6 +6,8 @@ use GuzzleHttp\Psr7\UriResolver;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use function GuzzleHttp\Psr7\modify_request;
+use Symfony\Component\Process\Exception\ProcessFailedException;
+use Symfony\Component\Process\Process;
 
 class CloudflareMiddleware
 {
@@ -30,21 +32,34 @@ class CloudflareMiddleware
     /** @var callable */
     protected $nextHandler;
 
+    /** @var string|null */
+    protected $nodePath;
+
+    /** @var string|null */
+    protected $nodeModulesPath;
+
     /**
      * @param callable $nextHandler Next handler to invoke.
+     * @param string|null $nodePath path to node executable, default null (use global node)
+     * @param string|null @nodeModulesPath path to nodemodules with installed browser-env and sandbox.js, default null (use global modules)
      */
-    public function __construct(callable $nextHandler)
+    public function __construct(callable $nextHandler, $nodePath = null, $nodeModulesPath = null)
     {
         $this->nextHandler = $nextHandler;
+        $this->nodePath = $nodePath;
+        $this->nodeModulesPath = $nodeModulesPath;
     }
 
     /**
+     * @param string|null $nodePath path to node executable, default null (use global node)
+     * @param string|null @nodeModulesPath path to nodemodules with installed browser-env and sandbox.js, default null (use global modules)
      * @return \Closure
      */
-    public static function create()
+    public static function create($nodePath = null, $nodeModulesPath = null)
     {
-        return function ($handler) {
-            return new static($handler);
+        return function ($handler) use($nodePath, $nodeModulesPath)
+        {
+            return new static($handler, $nodePath, $nodeModulesPath);
         };
     }
 
@@ -107,8 +122,6 @@ class CloudflareMiddleware
      */
     protected function modifyRequest(RequestInterface $request, ResponseInterface $response)
     {
-        sleep(8);
-
         return modify_request(
             $request,
             [
@@ -142,7 +155,6 @@ class CloudflareMiddleware
 
     /**
      * Try to solve the JavaScript challenge
-     * Thanks to: KyranRana, https://github.com/KyranRana/cloudflare-bypass
      *
      * @param \Psr\Http\Message\RequestInterface $request
      * @param \Psr\Http\Message\ResponseInterface $response
@@ -152,74 +164,114 @@ class CloudflareMiddleware
     protected function solveJavascriptChallenge(RequestInterface $request, ResponseInterface $response)
     {
         $content = $response->getBody();
-
-        /*
-         * Source: https://github.com/KyranRana/cloudflare-bypass/blob/master/v2/src/CloudflareBypass/CFBypass.php
-         */
-
-        /*
-         * Extract "jschl_vc" and "pass" params
-         */
-        preg_match_all('/name="\w+" value="(.+?)"/', $content, $matches);
-
-        if (!isset($matches[1]) || !isset($matches[1][1])) {
-            throw new \ErrorException('Unable to fetch jschl_vc and pass values; maybe not protected?');
+        $script = 
+<<<SCRIPT
+require('browser-env')({url: '{$request->getUri()}'});
+var sandbox = require('sandbox.js'),
+    console_log = function(o){console.log(o);},
+    context = {require: require, DOMParser: DOMParser, document: document, HTMLFormElement: HTMLFormElement, CustomEvent: CustomEvent, window: window, setTimeout: setTimeout, location: location, console_log: console_log},
+    code = function(){
+(function(){
+    var parser = new DOMParser(),
+        content = 'text/html',
+        divElement = document.createElement('div'),
+        form
+    ;
+    divElement.setAttribute('id', 'cf-content');
+    document.body.appendChild(divElement);
+    HTMLFormElement.prototype.submit = function(){
+        var params = [];
+        for(var el of this.elements) {
+            params.push(encodeURIComponent(el.name)+ '=' + encodeURIComponent(el.value));
         }
+        params.push('f=1')
+        this.action += '?' + params.join('&');
+        var event = new CustomEvent("submit", {detail: this.action});
+        this.dispatchEvent(event);
+    };
+    {$this->findForms($content)}
+})();
+{$this->findScripts($content)};
+(function(){var event = new CustomEvent("DOMContentLoaded", {});document.dispatchEvent(event);})();
+}
+;
+sandbox.runInSandbox(code, context);
+SCRIPT;
 
-        $params = array();
-        list($params['jschl_vc'], $params['pass']) = $matches[1];
+        $tmpFile = tmpfile();
+        fwrite($tmpFile, $script);
+        fflush($tmpFile);
 
-        /*
-         * Extract JavaScript challenge logic
-         */
-        preg_match_all('/:[!\[\]+()]+|[-*+\/]?=[!\[\]+()]+/', $content, $matches);
+        $meta_data = stream_get_meta_data($tmpFile);
+        $filename = $meta_data["uri"];
 
-        if (!isset($matches[0]) || !isset($matches[0][0])) {
-            throw new \ErrorException('Unable to find javascript challenge logic; maybe not protected?');
+        $process = new Process($this->getProcessPath($filename));
+
+        try 
+        {
+            $process->mustRun();
+
+            return new Uri($process->getOutput());
+        } 
+        catch (ProcessFailedException $e) 
+        {
+            throw new \ErrorException(sprintf('Something went wrong! Please report an issue: %s', $e->getMessage()));
         }
-
-        try {
-            /*
-             * Convert challenge logic to PHP
-             */
-            $php_code = "";
-            foreach ($matches[0] as $js_code) {
-                // [] causes "invalid operator" errors; convert to integer equivalents
-                $js_code = str_replace(array(
-                    ")+(",
-                    "![]",
-                    "!+[]",
-                    "[]"
-                ), array(
-                    ").(",
-                    "(!1)",
-                    "(!0)",
-                    "(0)"
-                ), $js_code);
-                $php_code .= '$params[\'jschl_answer\']' . ($js_code[0] == ':' ? '=' . substr($js_code, 1) : $js_code) . ';';
-            }
-
-            /*
-             * Eval PHP and get solution
-             */
-            eval($php_code);
-            // Split url into components.
-            $uri = parse_url($request->getUri());
-            // Add host length to get final answer.
-            $params['jschl_answer'] += strlen($uri['host']);
-            /*
-             * 6. Generate clearance link
-             */
-            return new Uri(sprintf("/cdn-cgi/l/chk_jschl?%s",
-                http_build_query($params)
-            ));
-        } catch (Exception $ex) {
-            // PHP evaluation bug; inform user to report bug
-            throw new \ErrorException(sprintf('Something went wrong! Please report an issue: %s', $ex->getMessage()));
-        }
-
-
     }
 
+    /**
+     * Find all forms from content
+     * @param string $content 
+     * @return string
+     */
+    private function findForms($content)
+    {
+        $matches = [];
+        $forms = [];
+        preg_match_all('/<form.*?id="(?P<form_id>[\w-]+)".*?<\/form>/s', $content, $matches);
+        foreach($matches[0] as $_i => $_form) {
+            $_form = addslashes(str_replace(["\r", "\n"], '', $_form));
+            array_push(
+                $forms,
+<<<FORM
+form = parser.parseFromString("{$_form}", content).body.childNodes[0];
+divElement.appendChild(form);
+document.getElementById("{$matches['form_id'][$_i]}").addEventListener("submit", function(e){console_log(e.detail)});
+FORM
+            );
+        }
+        return join("\n", $forms);
+    }
 
+    /**
+     * Find all scripts from content
+     * @param string $content 
+     * @return string
+     */
+    private function findScripts($content)
+    {
+        $matches = [];
+        $scripts = [];
+        preg_match_all('/<script.*?>(?P<script>.+?)<\/script>/s', $content, $matches);
+        foreach($matches['script'] as $_script) {
+            array_push($scripts, $_script);
+        }
+        return join(";\n", $scripts);
+    }
+
+    /**
+     * @param string $scipt path to script
+     */
+    protected function getProcessPath($scipt)
+    {
+        $nodeModules = '';
+        if(null !== $this->nodeModulesPath) {
+            $nodeModules = sprintf('NODE_PATH=%s ', $this->nodeModulesPath);
+        }
+
+        if(null === $node = $this->nodePath) {
+            $node = 'node';
+        }
+        return sprintf('%s%s %s', $nodeModules, $node, $scipt);
+    }
 }
